@@ -9,6 +9,7 @@ import os
 from typing import Optional
 import uuid
 from services.email_client import send_email
+from google.cloud import firestore
 
 from services.firebase_client import db, auth as firebase_auth
 from models.user import UserCreate, UserPublic, LoginRequest
@@ -306,3 +307,71 @@ def get_firebase_token(
         return {"firebaseCustomToken": custom_token.decode()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generando token de Firebase: {str(e)}")
+
+
+
+
+
+
+
+# -------------------- Ruta de prueba de email -------------------- #       
+@router.post("/register-fcm-token")
+def register_fcm_token(fcm_data: dict, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = decode_jwt(token)
+    if not payload: raise HTTPException(401, "Token inválido")
+    
+    user_id = payload.get("sub")
+    request_user_id = fcm_data.get("user_id")
+    if request_user_id != user_id: raise HTTPException(403, "No autorizado")
+    
+    fcm_token = fcm_data.get("fcm_token")
+    if not fcm_token: raise HTTPException(400, "fcm_token requerido")
+    
+    token_data = {
+        "user_id": user_id,
+        "fcm_token": fcm_token,
+        "device_type": fcm_data.get("device_type", "unknown"),
+        "registered_at": datetime.utcnow(),
+        "is_active": True,
+        "last_updated": datetime.utcnow()
+    }
+    
+    import hashlib
+    token_hash = hashlib.md5(fcm_token.encode()).hexdigest()
+    token_id = f"{user_id}_{token_hash}"
+    
+    db.collection("fcm_tokens").document(token_id).set(token_data)
+    
+    user_ref = db.collection("users").document(user_id)
+    user_ref.update({
+        "fcm_tokens": firestore.ArrayUnion([fcm_token]),
+        "has_fcm_token": True,
+        "last_fcm_update": datetime.utcnow()
+    })
+    
+    return {"success": True, "token_id": token_id}
+
+@router.delete("/remove-fcm-token")
+def remove_fcm_token(fcm_token: str = Query(...), credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = decode_jwt(token)
+    if not payload: raise HTTPException(401, "Token inválido")
+    
+    user_id = payload.get("sub")
+    tokens_ref = db.collection("fcm_tokens")
+    query = tokens_ref.where("user_id", "==", user_id).where("fcm_token", "==", fcm_token).limit(1).stream()
+    
+    deleted = False
+    for doc in query:
+        doc.reference.delete()
+        deleted = True
+        break
+    
+    if deleted:
+        user_ref = db.collection("users").document(user_id)
+        user_ref.update({"fcm_tokens": firestore.ArrayRemove([fcm_token])})
+        remaining = user_ref.get().to_dict().get("fcm_tokens", [])
+        if not remaining: user_ref.update({"has_fcm_token": False})
+    
+    return {"success": deleted}
