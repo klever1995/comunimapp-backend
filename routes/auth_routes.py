@@ -326,6 +326,7 @@ def register_fcm_token(fcm_data: dict, credentials: HTTPAuthorizationCredentials
     if request_user_id != user_id: raise HTTPException(403, "No autorizado")
     
     fcm_token = fcm_data.get("fcm_token")
+    print(f"DEBUG - Registrando FCM token: user_id={user_id}, fcm_token={fcm_token}")
     if not fcm_token: raise HTTPException(400, "fcm_token requerido")
     
     token_data = {
