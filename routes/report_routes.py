@@ -117,7 +117,18 @@ async def create_report(
     # 5. Guardar en Firestore
     db.collection("reports").document(report_id).set(report_dict)
     
-    # 6. Crear notificación para el reportante
+    # 6. PRUEBA: Enviar notificación push al reportante
+    try:
+        from services.firebase_client import notify_self_on_report
+        notify_self_on_report(
+            user_id=user_id,
+            report_title=description[:50] if len(description) > 50 else description
+        )
+    except Exception as e:
+        print(f"Error en prueba de notificación push: {e}")
+        # No fallamos la creación del reporte por esto
+    
+    # 7. Crear notificación para el reportante
     create_notification(
         user_id=user_id,
         report_id=report_id,
@@ -126,7 +137,7 @@ async def create_report(
         notification_type=NotificationType.ASIGNACION_CASO
     )
     
-    # 7. Buscar admins para notificarles
+    # 8. Buscar admins para notificarles
     admins_ref = db.collection("users").where("role", "==", UserRole.ADMIN.value).stream()
     for admin_doc in admins_ref:
         admin_data = admin_doc.to_dict()
@@ -138,7 +149,7 @@ async def create_report(
             notification_type=NotificationType.ASIGNACION_CASO
         )
     
-    # 8. Preparar respuesta pública
+    # 9. Preparar respuesta pública
     response_data = {
         "id": report_id,
         "description": description,
