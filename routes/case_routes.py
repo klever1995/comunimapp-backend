@@ -37,12 +37,17 @@ def create_notification(user_id: str, report_id: Optional[str], title: str,
         notification_type=notification_type
     ).dict()
     
+    # ESTAS 4 LÍNEAS FALTAN - AGREGAR DATA CON REPORT_ID
+    if report_id:
+        notification_data["data"] = {"report_id": report_id}
+    else:
+        notification_data["data"] = {}
+    
     notification_data["id"] = str(uuid.uuid4())
     notification_data["created_at"] = datetime.utcnow()
     notification_data["is_read"] = False
     
     db.collection("notifications").document(notification_data["id"]).set(notification_data)
-
 
 # -------------------- Crear actualización de caso -------------------- #
 @router.post("/updates", response_model=CaseUpdatePublic, status_code=status.HTTP_201_CREATED)
@@ -173,6 +178,30 @@ async def create_case_update(
             message=f"Nueva actualización: {message[:100]}...",
             notification_type=notif_type
         )
+    
+    # 6b. Crear notificación para el ADMIN
+    # Buscar todos los usuarios admin
+    admin_users_ref = db.collection("users").where("role", "==", UserRole.ADMIN.value)
+    
+    for admin_doc in admin_users_ref.stream():
+        admin_data = admin_doc.to_dict()
+        admin_id = admin_data.get("id")
+        
+        if admin_id:  # Solo si el admin existe
+            # Determinar tipo de notificación para admin
+            admin_notif_type = NotificationType.NUEVO_AVANCE
+            if new_status == ReportStatus.CERRADO:
+                admin_notif_type = NotificationType.CIERRE_CASO
+            elif update_type == UpdateType.CAMBIO_ESTADO:
+                admin_notif_type = NotificationType.CAMBIO_ESTADO
+            
+            create_notification(
+                user_id=admin_id,
+                report_id=report_id,
+                title=f"Actualización en reporte asignado",
+                message=f"El encargado {username} actualizó el reporte: {message[:100]}...",
+                notification_type=admin_notif_type
+            )
     
     # 7. Preparar respuesta pública (ocultar encargado_id para mantener anonimato)
     response_data = {

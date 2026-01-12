@@ -36,8 +36,14 @@ def create_notification(user_id: str, report_id: Optional[str], title: str,
         notification_type=notification_type
     ).dict()
     
+    if report_id:
+        notification_data["data"] = {"report_id": report_id}
+    else:
+        notification_data["data"] = {}
+    
     notification_data["id"] = str(uuid.uuid4())
     notification_data["created_at"] = datetime.utcnow()
+    notification_data["is_read"] = False
     
     db.collection("notifications").document(notification_data["id"]).set(notification_data)
 
@@ -117,27 +123,7 @@ async def create_report(
     # 5. Guardar en Firestore
     db.collection("reports").document(report_id).set(report_dict)
     
-    # 6. PRUEBA: Enviar notificación push al reportante
-    try:
-        from services.firebase_client import notify_self_on_report
-        notify_self_on_report(
-            user_id=user_id,
-            report_title=description[:50] if len(description) > 50 else description
-        )
-    except Exception as e:
-        print(f"Error en prueba de notificación push: {e}")
-        # No fallamos la creación del reporte por esto
-    
-    # 7. Crear notificación para el reportante
-    create_notification(
-        user_id=user_id,
-        report_id=report_id,
-        title="Reporte creado exitosamente",
-        message=f"Tu reporte ha sido creado y está pendiente de revisión",
-        notification_type=NotificationType.ASIGNACION_CASO
-    )
-    
-    # 8. Buscar admins para notificarles
+    # 6. SOLO NOTIFICAR A LOS ADMINS (NO al reportante que acaba de crear)
     admins_ref = db.collection("users").where("role", "==", UserRole.ADMIN.value).stream()
     for admin_doc in admins_ref:
         admin_data = admin_doc.to_dict()
@@ -145,11 +131,11 @@ async def create_report(
             user_id=admin_data.get("id"),
             report_id=report_id,
             title="Nuevo reporte pendiente",
-            message=f"Hay un nuevo reporte pendiente de asignación",
-            notification_type=NotificationType.ASIGNACION_CASO
+            message=f"Hay un nuevo reporte pendiente de asignación: {description[:50]}...",
+            notification_type=NotificationType.NUEVO_REPORTE  # Usar tipo correcto
         )
     
-    # 9. Preparar respuesta pública
+    # 7. Preparar respuesta pública
     response_data = {
         "id": report_id,
         "description": description,
@@ -166,7 +152,6 @@ async def create_report(
     response_data["reporter_uid"] = None if is_anonymous else user_id
     
     return ReportPublic(**response_data)
-
 
 # -------------------- Listar reportes (con filtros) -------------------- #
 @router.get("/", response_model=List[ReportPublic])

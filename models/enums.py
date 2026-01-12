@@ -24,6 +24,7 @@ class UpdateType(str, Enum):
     CIERRE = "cierre"
 
 class NotificationType(str, Enum):
+    NUEVO_REPORTE = "nuevo_reporte" 
     ASIGNACION_CASO = "asignacion_caso"
     NUEVO_AVANCE = "nuevo_avance"
     CAMBIO_ESTADO = "cambio_estado"
