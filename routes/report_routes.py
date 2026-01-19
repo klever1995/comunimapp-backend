@@ -3,19 +3,20 @@ from fastapi import APIRouter, HTTPException, Depends, Query, status, Form, File
 from typing import List, Optional
 from datetime import datetime
 import uuid
+import os
 
 from services.cloudinary_client import cloudinary
 import cloudinary.uploader
 from services.firebase_client import db
-from models.report import Report, ReportCreate, ReportPublic, ReportLocation
+from models.report import ReportPublic, ReportLocation
 from models.enums import ReportStatus, ReportPriority, UserRole, NotificationType
 from models.notification import NotificationCreate
 from routes.auth_routes import get_current_user
 
+# Configuración del router
 router = APIRouter(tags=["Reports"])
 
-
-# -------------------- Funciones auxiliares -------------------- #
+# Funciones auxiliares para verificación de roles de usuario en reportes
 def is_admin(current_user: dict) -> bool:
     return current_user.get("role") == UserRole.ADMIN
 
@@ -25,9 +26,10 @@ def is_encargado(current_user: dict) -> bool:
 def is_reportante(current_user: dict) -> bool:
     return current_user.get("role") == UserRole.REPORTANTE
 
+# Función para creación de notificaciones en el sistema de reportes
 def create_notification(user_id: str, report_id: Optional[str], title: str, 
                        message: str, notification_type: NotificationType):
-    """Crea una notificación en Firestore"""
+
     notification_data = NotificationCreate(
         user_id=user_id,
         report_id=report_id,
@@ -48,7 +50,7 @@ def create_notification(user_id: str, report_id: Optional[str], title: str,
     db.collection("notifications").document(notification_data["id"]).set(notification_data)
 
 
-# -------------------- Crear reporte -------------------- #
+# Endpoint para creación de nuevos reportes por parte de usuarios reportantes
 @router.post("/", response_model=ReportPublic, status_code=status.HTTP_201_CREATED)
 async def create_report(
     description: str = Form(..., min_length=10),
@@ -61,10 +63,6 @@ async def create_report(
     images: List[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Crea un nuevo reporte con subida de imágenes a Cloudinary.
-    Solo reportantes pueden crear reportes.
-    """
     if not is_reportante(current_user):
         raise HTTPException(
             status_code=403, 
@@ -74,26 +72,45 @@ async def create_report(
     user_id = current_user.get("id")
     username = current_user.get("username", "unknown")
     
-    # 1. Subir imágenes a Cloudinary (SIN convertir a bytes)
+    # Procesamiento y validación de imágenes adjuntas al reporte
     image_urls = []
     if images:
         for image in images:
             try:
-                # Subir directamente el archivo a Cloudinary
+                allowed_extensions = {'.jpg', '.jpeg', '.png', '.gif'}
+                file_extension = os.path.splitext(image.filename)[1].lower()
+                if file_extension not in allowed_extensions:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Tipo de archivo no permitido: {image.filename}. Solo se aceptan JPG, PNG o GIF"
+                    )
+                
+                MAX_FILE_SIZE = 5 * 1024 * 1024
+                image.file.seek(0, 2)
+                file_size = image.file.tell()
+                image.file.seek(0)
+                
+                if file_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Imagen {image.filename} excede el tamaño máximo de 5MB"
+                    )
+                
                 upload_result = cloudinary.uploader.upload(
-                    image.file,  # Archivo directo, SIN leer bytes
+                    image.file,
                     folder=f"comunimapp/reports/{username}",
                     public_id=f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{image.filename}",
                     overwrite=True
                 )
                 image_urls.append(upload_result["secure_url"])
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, 
                     detail=f"Error subiendo imagen {image.filename}: {str(e)}"
                 )
     
-    # 2. Crear objeto location
     location = ReportLocation(
         latitude=latitude,
         longitude=longitude,
@@ -101,11 +118,11 @@ async def create_report(
         city=city
     )
     
-    # 3. Generar ID único para el reporte
+    # Generación de identificador único y timestamp para el reporte
     report_id = str(uuid.uuid4())
     created_at = datetime.utcnow()
     
-    # 4. Crear objeto Report para Firestore
+    # Preparación del documento de reporte para almacenamiento en Firestore
     report_dict = {
         "id": report_id,
         "description": description,
@@ -120,22 +137,68 @@ async def create_report(
         "assigned_to": None
     }
     
-    # 5. Guardar en Firestore
     db.collection("reports").document(report_id).set(report_dict)
+
+    # Envío de notificaciones push a todos los administradores del sistema
+    try:
+        print(f"[DEBUG NOTIFICACIÓN ADMIN] Buscando admins para notificar sobre reporte {report_id}")
+        
+        admins_ref = db.collection("users").where("role", "==", UserRole.ADMIN.value).stream()
+        admin_count = 0
+        success_count = 0
+        
+        for admin_doc in admins_ref:
+            admin_count += 1
+            admin_data = admin_doc.to_dict()
+            admin_id = admin_data.get("id")
+            admin_tokens = admin_data.get("fcm_tokens", [])
+            
+            if admin_tokens:
+                admin_token = admin_tokens[0]
+                print(f"[DEBUG NOTIFICACIÓN ADMIN] Enviando a admin {admin_id}, token: {admin_token[:20]}...")
+                
+                try:
+                    from firebase_admin import messaging
+                    
+                    message = messaging.Message(
+                        notification=messaging.Notification(
+                            title="📋 Nuevo reporte pendiente",
+                            body=f"Un nuevo reporte requiere asignación: '{description[:40]}...'",
+                        ),
+                        token=admin_token,
+                        data={
+                            "report_id": report_id,
+                            "type": "nuevo_reporte_admin"
+                        }
+                    )
+                    
+                    response = messaging.send(message)
+                    print(f"[DEBUG NOTIFICACIÓN ADMIN] Push enviado a admin {admin_id}. ID: {response}")
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"[ERROR NOTIFICACIÓN ADMIN] Error enviando a admin {admin_id}: {str(e)}")
+            else:
+                print(f"[DEBUG NOTIFICACIÓN ADMIN] Admin {admin_id} no tiene token FCM registrado.")
+        
+        print(f"[DEBUG NOTIFICACIÓN ADMIN] Resumen: {success_count}/{admin_count} admins notificados exitosamente.")
+        
+    except Exception as e:
+        print(f"[ERROR CRÍTICO NOTIFICACIÓN ADMIN] Falló el proceso de notificación a admins: {str(e)}")
     
-    # 6. SOLO NOTIFICAR A LOS ADMINS (NO al reportante que acaba de crear)
-    admins_ref = db.collection("users").where("role", "==", UserRole.ADMIN.value).stream()
-    for admin_doc in admins_ref:
+    # Creación de notificaciones en base de datos para todos los administradores
+    admins_ref_db = db.collection("users").where("role", "==", UserRole.ADMIN.value).stream()
+    for admin_doc in admins_ref_db:
         admin_data = admin_doc.to_dict()
         create_notification(
             user_id=admin_data.get("id"),
             report_id=report_id,
             title="Nuevo reporte pendiente",
             message=f"Hay un nuevo reporte pendiente de asignación: {description[:50]}...",
-            notification_type=NotificationType.NUEVO_REPORTE  # Usar tipo correcto
+            notification_type=NotificationType.NUEVO_REPORTE
         )
     
-    # 7. Preparar respuesta pública
+    # Preparación de respuesta pública para el cliente
     response_data = {
         "id": report_id,
         "description": description,
@@ -148,12 +211,11 @@ async def create_report(
         "assigned_to": None
     }
     
-    # Aplicar anonimato si corresponde
     response_data["reporter_uid"] = None if is_anonymous else user_id
     
     return ReportPublic(**response_data)
 
-# -------------------- Listar reportes (con filtros) -------------------- #
+# Endpoint para listar reportes con sistema de filtros por rol y estado
 @router.get("/", response_model=List[ReportPublic])
 def list_reports(
     status: Optional[ReportStatus] = Query(None),
@@ -161,36 +223,27 @@ def list_reports(
     assigned_to_me: Optional[bool] = Query(None, description="Filtrar solo reportes asignados a mí"),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Lista reportes según el rol del usuario:
-    - Admin: Ve todos los reportes
-    - Encargado: Ve reportes asignados a él
-    - Reportante: Ve solo sus propios reportes
-    """
+
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
     reports_ref = db.collection("reports")
     
-    # Aplicar filtros comunes
+    # Aplicación de filtros comunes por estado y prioridad
     if status:
         reports_ref = reports_ref.where("status", "==", status.value)
     if priority:
         reports_ref = reports_ref.where("priority", "==", priority.value)
     
-    # Filtrar según rol
+    # Filtrado de reportes según el rol del usuario autenticado
     if user_role == UserRole.ADMIN:
-        # Admin ve todo, no necesita filtro adicional
         pass
     elif user_role == UserRole.ENCARGADO:
         if assigned_to_me:
-            # Solo reportes asignados a este encargado
             reports_ref = reports_ref.where("assigned_to", "==", user_id)
         else:
-            # Encargado ve reportes asignados a él
             reports_ref = reports_ref.where("assigned_to", "==", user_id)
     elif user_role == UserRole.REPORTANTE:
-        # Reportante ve solo sus reportes
         reports_ref = reports_ref.where("reporter_uid", "==", user_id)
     else:
         raise HTTPException(status_code=403, detail="Rol no autorizado")
@@ -200,7 +253,7 @@ def list_reports(
         report_data = doc.to_dict()
         report_id = report_data.get("id")
         
-        # Preparar respuesta pública
+        # Preparación de datos públicos del reporte para respuesta
         response_data = {
             "id": report_id,
             "description": report_data.get("description"),
@@ -213,11 +266,11 @@ def list_reports(
             "assigned_to": report_data.get("assigned_to")
         }
         
-        # Determinar visibilidad de reporter_uid
+        # Lógica de anonimato para visibilidad del ID del reportante
         is_anonymous = report_data.get("is_anonymous_public", False)
         can_see_reporter = (
-            user_role == UserRole.ADMIN or  # Admin siempre ve
-            user_id == report_data.get("reporter_uid")  # Propio reportante
+            user_role == UserRole.ADMIN or
+            user_id == report_data.get("reporter_uid")
         )
         
         if can_see_reporter or not is_anonymous:
@@ -230,16 +283,13 @@ def list_reports(
     return reports
 
 
-# -------------------- Obtener reporte específico -------------------- #
+# Endpoint para obtener un reporte específico por su identificador único
 @router.get("/{report_id}", response_model=ReportPublic)
 def get_report(
     report_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Obtiene un reporte específico por ID.
-    Verificación de permisos según rol.
-    """
+
     doc = db.collection("reports").document(report_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Reporte no encontrado")
@@ -248,7 +298,7 @@ def get_report(
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
-    # Verificar permisos
+    # Validación de permisos de acceso basada en rol y asignación
     reporter_uid = report_data.get("reporter_uid")
     assigned_to = report_data.get("assigned_to")
     
@@ -266,7 +316,7 @@ def get_report(
             detail="No tienes permisos para ver este reporte"
         )
     
-    # Preparar respuesta
+    # Preparación de datos del reporte para respuesta al cliente
     response_data = {
         "id": report_id,
         "description": report_data.get("description"),
@@ -279,11 +329,11 @@ def get_report(
         "assigned_to": report_data.get("assigned_to")
     }
     
-    # Determinar visibilidad de reporter_uid
+    # Manejo de anonimato para exposición del ID del reportante
     is_anonymous = report_data.get("is_anonymous_public", False)
     can_see_reporter = (
-        user_role == UserRole.ADMIN or  # Admin siempre ve
-        user_id == reporter_uid  # Propio reportante
+        user_role == UserRole.ADMIN or
+        user_id == reporter_uid
     )
     
     if can_see_reporter or not is_anonymous:
@@ -294,24 +344,21 @@ def get_report(
     return ReportPublic(**response_data)
 
 
-# -------------------- Asignar reporte a encargado -------------------- #
+# Endpoint para asignar reportes a encargados específicos
 @router.put("/{report_id}/assign", response_model=ReportPublic)
 def assign_report(
     report_id: str,
     encargado_id: str = Query(..., description="ID del encargado a asignar"),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Asigna un reporte a un encargado.
-    Solo administradores pueden asignar reportes.
-    """
+
     if not is_admin(current_user):
         raise HTTPException(
             status_code=403, 
             detail="Solo administradores pueden asignar reportes"
         )
     
-    # Verificar que el reporte existe
+    # Verificación de existencia del reporte en Firestore
     report_ref = db.collection("reports").document(report_id)
     report_doc = report_ref.get()
     
@@ -320,14 +367,14 @@ def assign_report(
     
     report_data = report_doc.to_dict()
     
-    # Verificar que el reporte esté pendiente
+    # Validación del estado actual del reporte (debe estar pendiente)
     if report_data.get("status") != ReportStatus.PENDIENTE:
         raise HTTPException(
             status_code=400, 
             detail=f"El reporte ya está en estado: {report_data.get('status')}"
         )
     
-    # Verificar que el encargado existe y es encargado
+    # Verificación del encargado y validación de su rol
     encargado_doc = db.collection("users").document(encargado_id).get()
     if not encargado_doc.exists:
         raise HTTPException(status_code=404, detail="Encargado no encontrado")
@@ -336,7 +383,7 @@ def assign_report(
     if encargado_data.get("role") != UserRole.ENCARGADO:
         raise HTTPException(status_code=400, detail="El usuario no es un encargado")
     
-    # Actualizar reporte
+    # Actualización del estado y asignación del reporte en Firestore
     update_time = datetime.utcnow()
     report_ref.update({
         "assigned_to": encargado_id,
@@ -344,14 +391,13 @@ def assign_report(
         "updated_at": update_time
     })
     
-    # Obtener reporte actualizado
+    # Obtención del reporte actualizado para operaciones posteriores
     updated_doc = report_ref.get()
     updated_data = updated_doc.to_dict()
     
-    # Crear notificaciones
+    # Creación de notificaciones en base de datos para ambas partes
     reporter_uid = updated_data.get("reporter_uid")
     
-    # Notificar al reportante
     create_notification(
         user_id=reporter_uid,
         report_id=report_id,
@@ -360,7 +406,6 @@ def assign_report(
         notification_type=NotificationType.ASIGNACION_CASO
     )
     
-    # Notificar al encargado
     create_notification(
         user_id=encargado_id,
         report_id=report_id,
@@ -368,8 +413,93 @@ def assign_report(
         message="Se te ha asignado un nuevo reporte",
         notification_type=NotificationType.ASIGNACION_CASO
     )
-    
-    # Preparar respuesta
+
+    # Envío de notificación push al encargado asignado
+    try:
+        print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Buscando token del encargado {encargado_id}")
+        
+        encargado_tokens = encargado_data.get("fcm_tokens", [])
+        
+        if encargado_tokens:
+            encargado_token = encargado_tokens[0]
+            print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Token encontrado: {encargado_token[:20]}...")
+            
+            try:
+                from firebase_admin import messaging
+                
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title="📋 Nuevo reporte asignado",
+                        body=f"Se te ha asignado el reporte: '{report_data.get('description', '')[:40]}...'",
+                    ),
+                    token=encargado_token,
+                    data={
+                        "report_id": report_id,
+                        "type": "reporte_asignado",
+                        "assigner_id": current_user.get("id"),
+                        "priority": report_data.get("priority", "media")
+                    }
+                )
+                
+                response = messaging.send(message)
+                print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Push enviado al encargado. ID: {response}")
+                
+            except ImportError:
+                print("[ERROR] 'firebase-admin' no está instalado.")
+            except Exception as e:
+                print(f"[ERROR NOTIFICACIÓN ASIGNACIÓN] Error enviando push: {str(e)}")
+        else:
+            print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Encargado {encargado_id} no tiene token FCM registrado.")
+            
+    except Exception as e:
+        print(f"[ERROR CRÍTICO NOTIFICACIÓN ASIGNACIÓN] Falló todo el proceso: {str(e)}")
+
+    # Envío de notificación push al reportante original
+    try:
+        print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Buscando token del reportante {reporter_uid}")
+        
+        reporter_doc = db.collection("users").document(reporter_uid).get()
+        if reporter_doc.exists:
+            reporter_data = reporter_doc.to_dict()
+            reporter_tokens = reporter_data.get("fcm_tokens", [])
+            
+            if reporter_tokens:
+                reporter_token = reporter_tokens[0]
+                print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Token encontrado para reportante: {reporter_token[:20]}...")
+                
+                try:
+                    from firebase_admin import messaging
+                    
+                    message = messaging.Message(
+                        notification=messaging.Notification(
+                            title="✅ Reporte asignado",
+                            body=f"Tu reporte ha sido asignado a un encargado para su atención",
+                        ),
+                        token=reporter_token,
+                        data={
+                            "report_id": report_id,
+                            "type": "reporte_asignado_reporter",
+                            "assigned_to": encargado_id,
+                            "priority": report_data.get("priority", "media")
+                        }
+                    )
+                    
+                    response = messaging.send(message)
+                    print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Push enviado al reportante. ID: {response}")
+                    
+                except ImportError:
+                    print("[ERROR] 'firebase-admin' no está instalado.")
+                except Exception as e:
+                    print(f"[ERROR NOTIFICACIÓN ASIGNACIÓN] Error enviando push al reportante: {str(e)}")
+            else:
+                print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Reportante {reporter_uid} no tiene token FCM registrado.")
+        else:
+            print(f"[DEBUG NOTIFICACIÓN ASIGNACIÓN] Reportante {reporter_uid} no encontrado.")
+            
+    except Exception as e:
+        print(f"[ERROR CRÍTICO NOTIFICACIÓN ASIGNACIÓN] Falló proceso de notificación al reportante: {str(e)}")
+
+    # Preparación de respuesta con datos actualizados del reporte
     response_data = {
         "id": report_id,
         "description": updated_data.get("description"),
@@ -380,23 +510,18 @@ def assign_report(
         "created_at": updated_data.get("created_at"),
         "updated_at": updated_data.get("updated_at"),
         "assigned_to": encargado_id,
-        "reporter_uid": reporter_uid  # Admin siempre ve reporter_uid
+        "reporter_uid": reporter_uid
     }
     
     return ReportPublic(**response_data)
 
-
-# -------------------- Eliminar reporte -------------------- #
+# Endpoint para eliminación de reportes del sistema
 @router.delete("/{report_id}")
 def delete_report(
     report_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Elimina un reporte.
-    - Reportante: Solo si el reporte está PENDIENTE y es suyo
-    - Admin: Puede eliminar cualquier reporte
-    """
+
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
@@ -410,9 +535,8 @@ def delete_report(
     reporter_uid = report_data.get("reporter_uid")
     report_status = report_data.get("status")
     
-    # Verificar permisos
+    # Validación de permisos de eliminación según rol del usuario
     if user_role == UserRole.ADMIN:
-        # Admin puede eliminar cualquier reporte
         pass
     elif user_role == UserRole.REPORTANTE:
         if reporter_uid != user_id:
@@ -431,29 +555,24 @@ def delete_report(
             detail="No tienes permisos para eliminar reportes"
         )
     
-    # Eliminar reporte
+    # Eliminación del documento de reporte en Firestore
     report_ref.delete()
     
-    # Eliminar notificaciones relacionadas
+    # Eliminación de notificaciones asociadas al reporte eliminado
     notifications_ref = db.collection("notifications").where("report_id", "==", report_id).stream()
     for notif_doc in notifications_ref:
         notif_doc.reference.delete()
     
     return {"message": "Reporte eliminado correctamente"}
 
-
-# -------------------- Actualizar estado del reporte -------------------- #
+# Endpoint para actualización del estado de reportes existentes
 @router.patch("/{report_id}/status", response_model=ReportPublic)
 def update_report_status(
     report_id: str,
     new_status: ReportStatus = Query(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Actualiza el estado de un reporte.
-    - Encargado: Puede cambiar estado de reportes asignados a él
-    - Admin: Puede cambiar estado de cualquier reporte
-    """
+
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
@@ -466,9 +585,8 @@ def update_report_status(
     report_data = report_doc.to_dict()
     assigned_to = report_data.get("assigned_to")
     
-    # Verificar permisos
+    # Verificación de permisos por rol del usuario
     if user_role == UserRole.ADMIN:
-        # Admin puede cambiar cualquier estado
         pass
     elif user_role == UserRole.ENCARGADO:
         if assigned_to != user_id:
@@ -482,16 +600,15 @@ def update_report_status(
             detail="No tienes permisos para cambiar el estado"
         )
     
-    # Validar transiciones de estado
+    # Validación de transiciones de estado permitidas en el flujo de trabajo
     current_status = report_data.get("status")
     
-    # Solo permitir ciertas transiciones
     valid_transitions = {
         ReportStatus.PENDIENTE: [ReportStatus.ASIGNADO],
         ReportStatus.ASIGNADO: [ReportStatus.EN_PROCESO, ReportStatus.PENDIENTE],
         ReportStatus.EN_PROCESO: [ReportStatus.RESUELTO, ReportStatus.ASIGNADO],
         ReportStatus.RESUELTO: [ReportStatus.CERRADO, ReportStatus.EN_PROCESO],
-        ReportStatus.CERRADO: []  # Cerrado es final
+        ReportStatus.CERRADO: []
     }
     
     if current_status == ReportStatus.CERRADO:
@@ -503,18 +620,17 @@ def update_report_status(
             detail=f"Transición de estado inválida: {current_status} -> {new_status}"
         )
     
-    # Actualizar reporte
+    # Actualización del estado del reporte en Firestore
     update_time = datetime.utcnow()
     report_ref.update({
         "status": new_status.value,
         "updated_at": update_time
     })
     
-    # Obtener reporte actualizado
+    # Notificación al reportante cuando el caso se cierra
     updated_doc = report_ref.get()
     updated_data = updated_doc.to_dict()
     
-    # Crear notificación si cambia a CERRADO
     if new_status == ReportStatus.CERRADO:
         reporter_uid = updated_data.get("reporter_uid")
         
@@ -526,7 +642,7 @@ def update_report_status(
             notification_type=NotificationType.CIERRE_CASO
         )
     
-    # Preparar respuesta
+    # Preparación de respuesta con datos actualizados
     response_data = {
         "id": report_id,
         "description": updated_data.get("description"),
@@ -537,50 +653,43 @@ def update_report_status(
         "created_at": updated_data.get("created_at"),
         "updated_at": updated_data.get("updated_at"),
         "assigned_to": updated_data.get("assigned_to"),
-        "reporter_uid": updated_data.get("reporter_uid")  # Admin/encargado ven reporter_uid
+        "reporter_uid": updated_data.get("reporter_uid")
     }
     
     return ReportPublic(**response_data)
 
-# -------------------- Listar reportes asignados a un encargado -------------------- #
+
+# Endpoint específico para encargados para listar sus reportes asignados
 @router.get("/assigned-reports/", response_model=List[dict])
 def list_assigned_reports(
     status: Optional[ReportStatus] = Query(None),
     priority: Optional[ReportPriority] = Query(None),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Lista reportes asignados al encargado actual.
-    SOLO para usuarios con rol ENCARGADO.
-    """
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
-    # Verificar que el usuario es encargado
+    # Verificación de rol exclusivo para encargados
     if user_role != UserRole.ENCARGADO:
         raise HTTPException(
             status_code=403, 
             detail="Esta ruta es solo para encargados"
         )
     
-    # Construir query
     reports_ref = db.collection("reports")
-    
-    # Filtrar por reportes asignados a este encargado
     reports_ref = reports_ref.where("assigned_to", "==", user_id)
     
-    # Aplicar filtros opcionales
+    # Aplicación de filtros opcionales de estado y prioridad
     if status:
         reports_ref = reports_ref.where("status", "==", status.value)
     if priority:
         reports_ref = reports_ref.where("priority", "==", priority.value)
     
-    # Obtener reportes
+    # Recopilación y transformación de reportes asignados
     reports = []
     for doc in reports_ref.stream():
         report_data = doc.to_dict()
         
-        # Preparar respuesta
         report_response = {
             "id": doc.id,
             "description": report_data.get("description"),
@@ -597,7 +706,7 @@ def list_assigned_reports(
         
         reports.append(report_response)
     
-    # Ordenar por fecha de creación (más recientes primero)
+    # Ordenamiento cronológico inverso de reportes
     reports.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     
     return reports

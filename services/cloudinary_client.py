@@ -1,7 +1,8 @@
 import os
+import os
 import cloudinary
 
-# Configuración de Cloudinary
+# Configuración de Cloudinary para gestión de imágenes y archivos multimedia
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),

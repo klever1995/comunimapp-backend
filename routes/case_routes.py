@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query, status, Form, File
 from typing import List, Optional
 from datetime import datetime
 import uuid
+import os
 
 from services.firebase_client import db
 from services.cloudinary_client import cloudinary
@@ -13,10 +14,10 @@ from models.enums import UpdateType, ReportStatus, UserRole, NotificationType
 from models.notification import NotificationCreate
 from routes.auth_routes import get_current_user
 
+# Configuración del router
 router = APIRouter(tags=["Case Updates"])
 
-
-# -------------------- Funciones auxiliares -------------------- #
+# Funciones auxiliares para verificación de roles de usuario
 def is_admin(current_user: dict) -> bool:
     return current_user.get("role") == UserRole.ADMIN
 
@@ -26,9 +27,9 @@ def is_encargado(current_user: dict) -> bool:
 def is_reportante(current_user: dict) -> bool:
     return current_user.get("role") == UserRole.REPORTANTE
 
+# Función para crear notificaciones en la base de datos Firestore
 def create_notification(user_id: str, report_id: Optional[str], title: str, 
                        message: str, notification_type: NotificationType):
-    """Crea una notificación en Firestore"""
     notification_data = NotificationCreate(
         user_id=user_id,
         report_id=report_id,
@@ -37,7 +38,6 @@ def create_notification(user_id: str, report_id: Optional[str], title: str,
         notification_type=notification_type
     ).dict()
     
-    # ESTAS 4 LÍNEAS FALTAN - AGREGAR DATA CON REPORT_ID
     if report_id:
         notification_data["data"] = {"report_id": report_id}
     else:
@@ -49,7 +49,7 @@ def create_notification(user_id: str, report_id: Optional[str], title: str,
     
     db.collection("notifications").document(notification_data["id"]).set(notification_data)
 
-# -------------------- Crear actualización de caso -------------------- #
+# Endpoint para creación de actualizaciones en casos existentes
 @router.post("/updates", response_model=CaseUpdatePublic, status_code=status.HTTP_201_CREATED)
 async def create_case_update(
     report_id: str = Form(...),
@@ -59,24 +59,19 @@ async def create_case_update(
     images: List[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Crea una nueva actualización para un caso.
-    - Encargado: Solo para reportes asignados a él
-    - Admin: Para cualquier reporte
-    - Reportante: NO puede crear actualizaciones
-    """
+
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     username = current_user.get("username", "unknown")
     
-    # Verificar permisos: solo encargado o admin
+    # Verificación de permisos por rol de usuario
     if not (is_encargado(current_user) or is_admin(current_user)):
         raise HTTPException(
             status_code=403, 
             detail="Solo encargados y administradores pueden crear actualizaciones"
         )
     
-    # 1. Verificar que el reporte existe
+    # Validación de existencia del reporte en Firestore
     report_ref = db.collection("reports").document(report_id)
     report_doc = report_ref.get()
     
@@ -88,16 +83,15 @@ async def create_case_update(
     reporter_uid = report_data.get("reporter_uid")
     current_report_status = report_data.get("status")
     
-    # 2. Verificar que el usuario tiene permisos sobre este reporte
+    # Validación de permisos específicos sobre el reporte
     if is_encargado(current_user) and assigned_to != user_id:
         raise HTTPException(
             status_code=403, 
             detail="Solo puedes crear actualizaciones para reportes asignados a ti"
         )
     
-    # 3. Validar cambio de estado si se proporciona Y ES DIFERENTE al actual
+    # Validación y actualización de estado del reporte si se proporciona uno nuevo
     if new_status and new_status != current_report_status:
-        # Solo permitir ciertas transiciones de estado
         valid_transitions = {
             ReportStatus.PENDIENTE: [ReportStatus.ASIGNADO],
             ReportStatus.ASIGNADO: [ReportStatus.EN_PROCESO, ReportStatus.PENDIENTE],
@@ -115,23 +109,38 @@ async def create_case_update(
                 detail=f"Transición de estado inválida: {current_report_status} -> {new_status}"
             )
         
-        # Actualizar estado del reporte
         update_time = datetime.utcnow()
         report_ref.update({
             "status": new_status.value,
             "updated_at": update_time
         })
-    # Si new_status es el mismo que current_report_status, NO actualizar estado (pero sí crear avance)
     elif new_status and new_status == current_report_status:
-        # Solo crear avance sin cambiar estado
         pass
     
-    # 4. Subir imágenes a Cloudinary
+    # Procesamiento y validación de imágenes adjuntas
     image_urls = []
     if images:
         for image in images:
             try:
-                # Subir directamente a Cloudinary
+                allowed_extensions = {'.jpg', '.jpeg', '.png', '.gif'}
+                file_extension = os.path.splitext(image.filename)[1].lower()
+                if file_extension not in allowed_extensions:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Tipo de archivo no permitido: {image.filename}. Solo se aceptan JPG, PNG o GIF"
+                    )
+                
+                MAX_FILE_SIZE = 5 * 1024 * 1024
+                image.file.seek(0, 2)
+                file_size = image.file.tell()
+                image.file.seek(0)
+                
+                if file_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Imagen {image.filename} excede el tamaño máximo de 5MB"
+                    )
+                
                 upload_result = cloudinary.uploader.upload(
                     image.file,
                     folder=f"comunimapp/case_updates/{username}",
@@ -139,13 +148,15 @@ async def create_case_update(
                     overwrite=True
                 )
                 image_urls.append(upload_result["secure_url"])
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, 
                     detail=f"Error subiendo imagen {image.filename}: {str(e)}"
                 )
     
-    # 5. Crear actualización
+    # Creación del documento de actualización en Firestore
     update_id = str(uuid.uuid4())
     created_at = datetime.utcnow()
     
@@ -162,9 +173,66 @@ async def create_case_update(
     
     db.collection("case_updates").document(update_id).set(update_data)
     
-    # 6. Crear notificación para el reportante
+    # Envío de notificación push al reportante original del caso
     if reporter_uid:
-        # Determinar tipo de notificación basado en update_type
+        try:
+            print(f"[DEBUG NOTIFICACIÓN AVANCE] Buscando token del reportante {reporter_uid}")
+            
+            reporter_doc = db.collection("users").document(reporter_uid).get()
+            if reporter_doc.exists:
+                reporter_data = reporter_doc.to_dict()
+                reporter_tokens = reporter_data.get("fcm_tokens", [])
+                
+                if reporter_tokens:
+                    reporter_token = reporter_tokens[0]
+                    print(f"[DEBUG NOTIFICACIÓN AVANCE] Token encontrado: {reporter_token[:20]}...")
+                    
+                    try:
+                        from firebase_admin import messaging
+                        
+                        title = "📝 Nuevo avance en tu reporte"
+                        if new_status == ReportStatus.CERRADO:
+                            title = "✅ Caso cerrado"
+                        elif update_type == UpdateType.CAMBIO_ESTADO:
+                            title = "🔄 Cambio de estado"
+                        
+                        body = f"{username}: {message[:80]}..."
+                        if len(message) > 80:
+                            body += "..."
+                        
+                        message_obj = messaging.Message(
+                            notification=messaging.Notification(
+                                title=title,
+                                body=body,
+                            ),
+                            token=reporter_token,
+                            data={
+                                "report_id": report_id,
+                                "update_id": update_id,
+                                "type": "nuevo_avance",
+                                "update_type": update_type.value,
+                                "new_status": new_status.value if new_status else "",
+                                "encargado_name": username
+                            }
+                        )
+                        
+                        response = messaging.send(message_obj)
+                        print(f"[DEBUG NOTIFICACIÓN AVANCE]  Push enviado al reportante. ID: {response}")
+                        
+                    except ImportError:
+                        print("[ERROR] 'firebase-admin' no está instalado.")
+                    except Exception as e:
+                        print(f"[ERROR NOTIFICACIÓN AVANCE] Error enviando push: {str(e)}")
+                else:
+                    print(f"[DEBUG NOTIFICACIÓN AVANCE] Reportante {reporter_uid} no tiene token FCM registrado.")
+            else:
+                print(f"[DEBUG NOTIFICACIÓN AVANCE] Reportante {reporter_uid} no encontrado.")
+                
+        except Exception as e:
+            print(f"[ERROR CRÍTICO NOTIFICACIÓN AVANCE] Falló todo el proceso: {str(e)}")
+    
+    # Creación de notificaciones en base de datos para el reportante
+    if reporter_uid:
         notif_type = NotificationType.NUEVO_AVANCE
         if new_status == ReportStatus.CERRADO:
             notif_type = NotificationType.CIERRE_CASO
@@ -179,16 +247,14 @@ async def create_case_update(
             notification_type=notif_type
         )
     
-    # 6b. Crear notificación para el ADMIN
-    # Buscar todos los usuarios admin
+    # Creación de notificaciones para todos los administradores del sistema
     admin_users_ref = db.collection("users").where("role", "==", UserRole.ADMIN.value)
     
     for admin_doc in admin_users_ref.stream():
         admin_data = admin_doc.to_dict()
         admin_id = admin_data.get("id")
         
-        if admin_id:  # Solo si el admin existe
-            # Determinar tipo de notificación para admin
+        if admin_id:
             admin_notif_type = NotificationType.NUEVO_AVANCE
             if new_status == ReportStatus.CERRADO:
                 admin_notif_type = NotificationType.CIERRE_CASO
@@ -203,7 +269,7 @@ async def create_case_update(
                 notification_type=admin_notif_type
             )
     
-    # 7. Preparar respuesta pública (ocultar encargado_id para mantener anonimato)
+    # Preparación de respuesta pública para el cliente
     response_data = {
         "message": message,
         "update_type": update_type,
@@ -214,23 +280,17 @@ async def create_case_update(
     
     return CaseUpdatePublic(**response_data)
 
-
-# -------------------- Listar actualizaciones de un reporte -------------------- #
+# Endpoint para listar todas las actualizaciones de un reporte específico
 @router.get("/updates", response_model=List[CaseUpdatePublic])
 def list_case_updates(
     report_id: str = Query(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Lista todas las actualizaciones de un reporte específico.
-    - Reportante: Solo puede ver actualizaciones de sus propios reportes
-    - Encargado: Solo puede ver actualizaciones de reportes asignados a él
-    - Admin: Puede ver actualizaciones de cualquier reporte
-    """
+
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
-    # 1. Verificar que el reporte existe y obtener sus datos
+    # Verificación de existencia del reporte en Firestore
     report_doc = db.collection("reports").document(report_id).get()
     if not report_doc.exists:
         raise HTTPException(status_code=404, detail="Reporte no encontrado")
@@ -239,7 +299,7 @@ def list_case_updates(
     assigned_to = report_data.get("assigned_to")
     reporter_uid = report_data.get("reporter_uid")
     
-    # 2. Verificar permisos para ver este reporte
+    # Validación de permisos según rol del usuario
     can_view = False
     if user_role == UserRole.ADMIN:
         can_view = True
@@ -254,14 +314,13 @@ def list_case_updates(
             detail="No tienes permisos para ver las actualizaciones de este reporte"
         )
     
-    # 3. Obtener actualizaciones
+    # Obtención de actualizaciones desde la colección case_updates
     updates_ref = db.collection("case_updates").where("report_id", "==", report_id)
     updates = []
     
     for doc in updates_ref.stream():
         update_data = doc.to_dict()
         
-        # Preparar respuesta pública (ocultar encargado_id)
         update_public = {
             "message": update_data.get("message"),
             "update_type": UpdateType(update_data.get("update_type")),
@@ -272,23 +331,18 @@ def list_case_updates(
         
         updates.append(CaseUpdatePublic(**update_public))
     
-    # Ordenar por fecha de creación (más reciente primero)
+    # Ordenamiento cronológico inverso (más reciente primero)
     updates.sort(key=lambda x: x.created_at, reverse=True)
     
     return updates
 
-
-# -------------------- Obtener actualización específica -------------------- #
+# Endpoint para obtener una actualización específica de caso por su ID
 @router.get("/updates/{update_id}", response_model=CaseUpdatePublic)
 def get_case_update(
     update_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Obtiene una actualización específica por ID.
-    Mismos permisos que listar actualizaciones.
-    """
-    # 1. Obtener la actualización
+    # Obtención del documento de actualización desde Firestore
     update_doc = db.collection("case_updates").document(update_id).get()
     if not update_doc.exists:
         raise HTTPException(status_code=404, detail="Actualización no encontrada")
@@ -296,7 +350,7 @@ def get_case_update(
     update_data = update_doc.to_dict()
     report_id = update_data.get("report_id")
     
-    # 2. Verificar permisos a través del reporte asociado
+    # Verificación del reporte asociado a la actualización
     report_doc = db.collection("reports").document(report_id).get()
     if not report_doc.exists:
         raise HTTPException(status_code=404, detail="Reporte asociado no encontrado")
@@ -307,7 +361,7 @@ def get_case_update(
     assigned_to = report_data.get("assigned_to")
     reporter_uid = report_data.get("reporter_uid")
     
-    # 3. Verificar permisos
+    # Validación de permisos de visualización según rol del usuario
     can_view = False
     if user_role == UserRole.ADMIN:
         can_view = True
@@ -322,7 +376,7 @@ def get_case_update(
             detail="No tienes permisos para ver esta actualización"
         )
     
-    # 4. Preparar respuesta pública
+    # Preparación de datos para respuesta pública
     response_data = {
         "message": update_data.get("message"),
         "update_type": UpdateType(update_data.get("update_type")),
@@ -334,22 +388,16 @@ def get_case_update(
     return CaseUpdatePublic(**response_data)
 
 
-# -------------------- Eliminar actualización -------------------- #
+# Endpoint para eliminación de actualizaciones de casos existentes
 @router.delete("/updates/{update_id}")
 def delete_case_update(
     update_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Elimina una actualización.
-    - Admin: Puede eliminar cualquier actualización
-    - Encargado: Solo puede eliminar sus propias actualizaciones
-    - Reportante: NO puede eliminar actualizaciones
-    """
     user_id = current_user.get("id")
     user_role = current_user.get("role")
     
-    # 1. Obtener la actualización
+    # Obtención del documento de actualización a eliminar
     update_ref = db.collection("case_updates").document(update_id)
     update_doc = update_ref.get()
     
@@ -360,19 +408,17 @@ def delete_case_update(
     encargado_id = update_data.get("encargado_id")
     encargado_username = None
     
-    # Obtener username del encargado para encontrar la carpeta correcta
+    # Obtención del nombre de usuario del encargado para estructura de carpetas
     if encargado_id:
         encargado_doc = db.collection("users").document(encargado_id).get()
         if encargado_doc.exists:
             encargado_data = encargado_doc.to_dict()
             encargado_username = encargado_data.get("username", "unknown")
     
-    # 2. Verificar permisos
+    # Validación de permisos de eliminación según rol del usuario
     if user_role == UserRole.ADMIN:
-        # Admin puede eliminar cualquier actualización
         pass
     elif user_role == UserRole.ENCARGADO and encargado_id == user_id:
-        # Encargado solo puede eliminar sus propias actualizaciones
         pass
     else:
         raise HTTPException(
@@ -380,59 +426,48 @@ def delete_case_update(
             detail="No tienes permisos para eliminar esta actualización"
         )
     
-    # 3. Eliminar imágenes de Cloudinary si existen (AHORA PARA AMBOS ROLES)
+    # Eliminación de imágenes asociadas en Cloudinary si existen
     images = update_data.get("images")
     if images:
         for image_url in images:
             try:
-                # Extraer public_id de la URL de Cloudinary
                 url_parts = image_url.split("/")
                 if "cloudinary.com" in image_url:
-                    # Encontrar el índice después de "upload"
                     upload_index = url_parts.index("upload") if "upload" in url_parts else -1
                     if upload_index >= 0 and upload_index + 2 < len(url_parts):
-                        # La estructura es: .../upload/v1234567/folder/public_id.jpg
                         version_folder = url_parts[upload_index + 1]
                         filename_parts = url_parts[upload_index + 2].split(".")
                         if len(filename_parts) >= 2:
                             public_id = filename_parts[0]
                             
-                            # Determinar la carpeta basada en el username del encargado
                             if encargado_username:
                                 folder = f"comunimapp/case_updates/{encargado_username}"
                                 full_public_id = f"{folder}/{public_id}"
                             else:
-                                # Fallback: intentar con el public_id completo
                                 full_public_id = f"comunimapp/case_updates/{public_id}"
                             
-                            # Intentar eliminar la imagen de Cloudinary
                             result = cloudinary.uploader.destroy(full_public_id)
                             
-                            # También intentar sin folder por si está en root
                             if result.get("result") != "ok":
                                 cloudinary.uploader.destroy(public_id)
                                 
             except Exception as e:
-                # Continuar incluso si falla la eliminación de Cloudinary
                 print(f"Advertencia: Error eliminando imagen de Cloudinary ({image_url}): {e}")
     
-    # 4. Eliminar de Firestore
+    # Eliminación del documento de actualización en Firestore
     update_ref.delete()
     
     return {"message": "Actualización eliminada correctamente"}
 
 
-# -------------------- Contar actualizaciones por reporte -------------------- #
+# Endpoint para contar el número de actualizaciones asociadas a un reporte específico
 @router.get("/updates/{report_id}/count")
 def count_case_updates(
     report_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Cuenta el número de actualizaciones de un reporte.
-    Mismos permisos que listar actualizaciones.
-    """
-    # Verificar permisos (usando la misma lógica que list_case_updates)
+
+    # Validación de existencia del reporte en Firestore
     report_doc = db.collection("reports").document(report_id).get()
     if not report_doc.exists:
         raise HTTPException(status_code=404, detail="Reporte no encontrado")
@@ -443,6 +478,7 @@ def count_case_updates(
     assigned_to = report_data.get("assigned_to")
     reporter_uid = report_data.get("reporter_uid")
     
+    # Verificación de permisos de visualización según rol del usuario
     can_view = False
     if user_role == UserRole.ADMIN:
         can_view = True
@@ -457,11 +493,10 @@ def count_case_updates(
             detail="No tienes permisos para ver este reporte"
         )
     
-    # Contar actualizaciones
+    # Conteo de documentos en la colección case_updates para el reporte específico
     updates_ref = db.collection("case_updates").where("report_id", "==", report_id)
     count = 0
     for _ in updates_ref.stream():
         count += 1
     
     return {"report_id": report_id, "update_count": count}
-
