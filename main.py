@@ -1,13 +1,18 @@
 # main.py - Punto de entrada principal de la aplicación FastAPI
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Carga de variables de entorno (Indispensable para que la IA lea tu API Key)
+load_dotenv()
 
 from routes import auth_routes
 from routes import user_routes
 from routes import report_routes
 from routes import case_routes
 from routes import notification_routes
-from routes import metrics_routes
+from routes import metrics_routes  # Se agrega la importación de métricas
 
 # Configuración de la aplicación FastAPI con metadatos descriptivos
 app = FastAPI(
@@ -33,6 +38,7 @@ app.include_router(case_routes.router, prefix="/cases", tags=["cases"])
 app.include_router(
     notification_routes.router, prefix="/notifications", tags=["notifications"]
 )
+# Registro del router de métricas e IA
 app.include_router(metrics_routes.router, prefix="/metrics", tags=["metrics"])
 
 
