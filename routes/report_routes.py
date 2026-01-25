@@ -49,7 +49,6 @@ def create_notification(user_id: str, report_id: Optional[str], title: str,
     
     db.collection("notifications").document(notification_data["id"]).set(notification_data)
 
-
 # Endpoint para creación de nuevos reportes por parte de usuarios reportantes
 @router.post("/", response_model=ReportPublic, status_code=status.HTTP_201_CREATED)
 async def create_report(
@@ -151,10 +150,9 @@ async def create_report(
             admin_count += 1
             admin_data = admin_doc.to_dict()
             admin_id = admin_data.get("id")
-            admin_tokens = admin_data.get("fcm_tokens", [])
-            
-            if admin_tokens:
-                admin_token = admin_tokens[0]
+            admin_token = admin_data.get("fcm_token")  # Token único del admin
+
+            if admin_token:  # ← Verifica si admin_token existe (no admin_tokens)
                 print(f"[DEBUG NOTIFICACIÓN ADMIN] Enviando a admin {admin_id}, token: {admin_token[:20]}...")
                 
                 try:

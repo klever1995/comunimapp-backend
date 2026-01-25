@@ -352,7 +352,7 @@ def register_fcm_token(fcm_data: dict, credentials: HTTPAuthorizationCredentials
     # Actualizar referencia de tokens en el documento del usuario
     user_ref = db.collection("users").document(user_id)
     user_ref.update({
-        "fcm_tokens": [fcm_token], 
+        "fcm_token": fcm_token, 
         "has_fcm_token": True,
         "last_fcm_update": datetime.utcnow()
     })

@@ -181,10 +181,10 @@ async def create_case_update(
             reporter_doc = db.collection("users").document(reporter_uid).get()
             if reporter_doc.exists:
                 reporter_data = reporter_doc.to_dict()
-                reporter_tokens = reporter_data.get("fcm_tokens", [])
+                reporter_token = reporter_data.get("fcm_token")
                 
-                if reporter_tokens:
-                    reporter_token = reporter_tokens[0]
+                if reporter_token:
+                
                     print(f"[DEBUG NOTIFICACIÓN AVANCE] Token encontrado: {reporter_token[:20]}...")
                     
                     try:
