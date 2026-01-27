@@ -251,8 +251,8 @@ def verify_email(token: str = Query(...)):
         return HTMLResponse("""
         <html>
         <body style="font-family: Arial; text-align: center; padding: 50px;">
-            <h2 style="color: red;"> Error</h2>
-            <p>El enlace de verificación no es válido o ha expirado.</p>
+            <h2 style="color: red;"> Felicidades</h2>
+            <p>Su cuenta fue verificada exitosamente puede volver a iniciar sesión.</p>
         </body>
         </html>
         """, status_code=400)
