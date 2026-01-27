@@ -114,7 +114,7 @@ def _register_user(user_data: UserCreate) -> dict:
     
     # Enviar email de verificación si es necesario
     if needs_verification:
-        verify_link = f"http://localhost:8000/auth/verify-email?token={verification_token}"
+        verify_link = f"https://comunimapp-backend.onrender.com/auth/verify-email?token={verification_token}"
         email_body = f"""
         <html>
             <head>
