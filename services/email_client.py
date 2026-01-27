@@ -1,30 +1,28 @@
 import os
-import smtplib
-from email.message import EmailMessage
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 from dotenv import load_dotenv
 
-# Configuración del servicio de correo electrónico
+# Carga variables de entorno desde .env (solo para desarrollo local)
 load_dotenv()
 
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 25))
+# Variables de entorno
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+FROM_EMAIL = os.getenv("EMAIL_ADDRESS")  # el correo que usas para enviar
 
-# Función para enviar correos electrónicos utilizando el protocolo SMTP
 def send_email(to_email: str, subject: str, body: str):
-    msg = EmailMessage()
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body, subtype="html")
+
+    message = Mail(
+        from_email=FROM_EMAIL,
+        to_emails=to_email,
+        subject=subject,
+        html_content=body
+    )
 
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
-            smtp.starttls()
-            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print(f"Correo enviado a {to_email}")
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"Email enviado a {to_email} - status {response.status_code}")
     except Exception as e:
-        print(f"No se pudo enviar el correo a {to_email}: {e}")
+        print(f"Error enviando email a {to_email}: {e}")
         raise e
