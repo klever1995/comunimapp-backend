@@ -54,14 +54,14 @@ backend/
 
 ### 🔧 Instalación y Configuración
 
-### 1. Requisitos Previos
+#### 1. Requisitos Previos
 * Python 3.9 o superior
 * Cuenta de Firebase
 * Cuenta de SendGrid
 * Cuenta de Cloudinary
 * API Key de Google Gemini
 
-### 2. Instalación
+#### 2. Instalación
 ```bash
 # Clonar el repositorio
 git clone https://github.com/klever1995/comunimapp-backend.git
@@ -79,7 +79,7 @@ venv\Scripts\activate
 # Instalar dependencias
 pip install -r requirements.txt
 ```
-### 3. Configuración de Variables de Entorno
+#### 3. Configuración de Variables de Entorno
 
 Crear un archivo `.env` en la raíz del proyecto con el siguiente contenido:
 
@@ -107,7 +107,7 @@ CLOUDINARY_API_SECRET=tu-secreto
 # Google Gemini
 API_KEY_AIGOOGLE=tu-api-key-gemini
 ```
-### 4. Ejecución Local
+#### 4. Ejecución Local
 
 Ejecutar la aplicación en modo desarrollo:
 
