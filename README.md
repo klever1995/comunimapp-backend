@@ -1,11 +1,11 @@
-## 📢 Sistema de Gestión de Reportes Ciudadanos
+### 📢 Sistema de Gestión de Reportes Ciudadanos
 **Proyecto UCE - Facultad de Ingeniería y Ciencias Aplicadas**
 
-## 📋 Descripción del Proyecto
+### 📋 Descripción del Proyecto
 
 API REST desarrollada con **FastAPI** para la gestión de reportes ciudadanos, permitiendo a los usuarios reportar incidencias, asignar responsables, realizar seguimiento y generar análisis estadísticos con inteligencia artificial.
 
-## 🚀 Características Principales
+### 🚀 Características Principales
 
 - Autenticación por roles (Reportante, Encargado, Administrador)
 - Gestión completa de reportes con geolocalización
@@ -16,7 +16,7 @@ API REST desarrollada con **FastAPI** para la gestión de reportes ciudadanos, p
 - Gestión multimedia con Cloudinary
 - API documentada automáticamente (Swagger / OpenAPI)
 
-## 🛠️ Tecnologías Utilizadas
+### 🛠️ Tecnologías Utilizadas
 
 | Componente            | Tecnología                     |
 |----------------------|--------------------------------|
@@ -29,7 +29,7 @@ API REST desarrollada con **FastAPI** para la gestión de reportes ciudadanos, p
 | Inteligencia Artificial | Google Gemini API           |
 | Despliegue           | Render                         |
 
-## 📁 Estructura del Proyecto
+### 📁 Estructura del Proyecto
 
 ```text
 backend/
@@ -52,7 +52,7 @@ backend/
 └── main.py             # Punto de entrada
 ```
 
-## 🔧 Instalación y Configuración
+### 🔧 Instalación y Configuración
 
 ### 1. Requisitos Previos
 * Python 3.9 o superior
